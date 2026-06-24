@@ -2,7 +2,9 @@
     "permissions": {
         "allow": [
             "Write(planning/REVIEW.md)",
-            "Edit(planning/REVIEW.md)"
+            "Edit(planning/REVIEW.md)",
+            "Bash(git *)",
+            "Read"
         ]
     },
     "hooks": {

@@ -75,7 +75,7 @@ The user runs a single Docker command (or a provided start script). A browser op
 |---|---|
 | SSE over WebSockets | One-way push is all we need; simpler, no bidirectional complexity, universal browser support |
 | Static Next.js export | Single origin, no CORS issues, one port, one container, simple deployment |
-| SQLite over Postgres | No auth = no multi-user = no need for a database server; self-contained, zero config |
+| SQLite over Postgres | Single-user for now, schema is multi-user-ready (all tables carry a `user_id`); no database server needed; self-contained, zero config |
 | Single Docker container | Students run one command; no docker-compose for production, no service orchestration |
 | uv for Python | Fast, modern Python project management; reproducible lockfile; what students should learn |
 | Market orders only | Eliminates order book, limit order logic, partial fills — dramatically simpler portfolio math |
@@ -110,7 +110,7 @@ finally/
 
 - **`frontend/`** is a self-contained Next.js project. It knows nothing about Python. It talks to the backend via `/api/*` endpoints and `/api/stream/*` SSE endpoints. Internal structure is up to the Frontend Engineer agent.
 - **`backend/`** is a self-contained uv project with its own `pyproject.toml`. It owns all server logic including database initialization, schema, seed data, API routes, SSE streaming, market data, and LLM integration. Internal structure is up to the Backend/Market Data agents.
-- **`backend/db/`** contains schema SQL definitions and seed logic. The backend lazily initializes the database on first request — creating tables and seeding default data if the SQLite file doesn't exist or is empty.
+- **`backend/db/`** contains schema SQL definitions and seed logic. The backend initializes the database on startup — creating tables and seeding default data if the SQLite file doesn't exist or is empty.
 - **`db/`** at the top level is the runtime volume mount point. The SQLite file (`db/finally.db`) is created here by the backend and persists across container restarts via Docker volume.
 - **`planning/`** contains project-wide documentation, including this plan. All agents reference files here as the shared contract.
 - **`test/`** contains Playwright E2E tests and supporting infrastructure (e.g., `docker-compose.test.yml`). Unit tests live within `frontend/` and `backend/` respectively, following each framework's conventions.
@@ -124,7 +124,7 @@ finally/
 # Required: OpenCode API key for LLM chat functionality
 OPENCODE_API_KEY=your-opencode-api-key-here
 
-# Optional: Massive (Polygon.io) API key for real market data
+# Optional: Massive API key for real market data (Massive is a custom wrapper for Polygon.io)
 # If not set, the built-in market simulator is used (recommended for most users)
 MASSIVE_API_KEY=
 
@@ -134,6 +134,7 @@ LLM_MOCK=false
 
 ### Behavior
 
+- If `OPENCODE_API_KEY` is absent or empty → backend **fails fast at startup** with a clear error message (e.g., `OPENCODE_API_KEY is required but not set`). The chat feature is central to the product; a silent disable would be confusing.
 - If `MASSIVE_API_KEY` is set and non-empty → backend uses Massive REST API for market data
 - If `MASSIVE_API_KEY` is absent or empty → backend uses the built-in market simulator
 - If `LLM_MOCK=true` → backend returns deterministic mock LLM responses (for E2E tests)
@@ -147,16 +148,28 @@ LLM_MOCK=false
 
 Both the simulator and the Massive client implement the same abstract interface. The backend selects which to use based on the environment variable. All downstream code (SSE streaming, price cache, frontend) is agnostic to the source.
 
+### Timing Constants
+
+| Constant | Value | Where used |
+|---|---|---|
+| Simulator tick interval | 500ms | Price updates, GBM step |
+| SSE push cadence | 500ms (simulator) / adapts to source | Price stream to frontend |
+| Portfolio snapshot interval | 30s | `portfolio_snapshots` background task |
+| Massive API poll (free tier) | 15s | 5 calls/min limit |
+| Massive API poll (paid tier) | 2–15s | Configurable |
+
 ### Simulator (Default)
 
 - Generates prices using geometric Brownian motion (GBM) with configurable drift and volatility per ticker
-- Updates at ~500ms intervals
-- Correlated moves across tickers (e.g., tech stocks move together)
+- Updates at 500ms intervals (see Timing Constants)
+- Correlated moves: each tick generates a shared **market factor** (small normal random) combined with per-ticker noise: `price = prev * exp((drift - 0.5*vol²)*dt + vol*sqrt(dt)*(β*market_factor + sqrt(1-β²)*noise))`. Tech stocks use β≈0.7, others β≈0.3.
 - Occasional random "events" — sudden 2-5% moves on a ticker for drama
 - Starts from realistic seed prices (e.g., AAPL ~$190, GOOGL ~$175, etc.)
 - Runs as an in-process background task — no external dependencies
 
 ### Massive API (Optional)
+
+Massive is a custom wrapper around Polygon.io's REST API. The name "Massive" is used throughout the plan and code — if you see "Massive" anywhere, it refers to this wrapper.
 
 - REST API polling (not WebSocket) — simpler, works on all tiers
 - Polls for the union of all watched tickers on a configurable interval
@@ -175,7 +188,7 @@ Both the simulator and the Massive client implement the same abstract interface.
 
 - Endpoint: `GET /api/stream/prices`
 - Long-lived SSE connection; client uses native `EventSource` API
-- Server pushes price updates for all tickers known to the system at a regular cadence (~500ms) — in the single-user model this is equivalent to the user's watchlist
+- Server pushes price updates for **tickers currently on the watchlist** at the source's refresh cadence — 500ms when using the simulator, every 15s when polling Massive API (free tier), every 2-15s on paid tiers. When the user adds a new ticker, the simulator begins tracking it and it appears in the SSE stream on the next tick — no reconnect needed.
 - Each SSE event contains ticker, price, previous price, timestamp, and change direction
 - Client handles reconnection automatically (EventSource has built-in retry)
 
@@ -183,9 +196,11 @@ Both the simulator and the Massive client implement the same abstract interface.
 
 ## 7. Database
 
-### SQLite with Lazy Initialization
+### SQLite with Startup Initialization
 
-The backend checks for the SQLite database on startup (or first request). If the file doesn't exist or tables are missing, it creates the schema and seeds default data. This means:
+**Security note**: All SQL queries must use parameterized statements to prevent SQL injection. This applies to every query across the codebase — schema init, seed data, trades, watchlist management, chat history, and snapshots. Raw string interpolation in SQL is never acceptable.
+
+The backend checks for the SQLite database on startup. If the file doesn't exist or tables are missing, it creates the schema and seeds default data before serving any requests. This means:
 
 - No separate migration step
 - No manual database setup
@@ -225,7 +240,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 - `price` REAL
 - `executed_at` TEXT (ISO timestamp)
 
-**portfolio_snapshots** — Portfolio value over time (for P&L chart). Recorded every 30 seconds by a background task, and immediately after each trade execution.
+**portfolio_snapshots** — Portfolio value over time (for P&L chart). Recorded every 30 seconds by a background task, and immediately after each trade execution. The frontend P&L chart must handle irregular time intervals gracefully — snapshots may cluster (e.g., multiple rapid trades followed by quiet periods), producing uneven spacing on the time axis.
 - `id` TEXT PRIMARY KEY (UUID)
 - `user_id` TEXT (default: `"default"`)
 - `total_value` REAL
@@ -248,6 +263,20 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 
 ## 8. API Endpoints
 
+### Consistent Response Envelope
+
+Every REST endpoint returns a standard envelope JSON:
+
+```json
+{"success": true, "data": { ... }}
+{"success": false, "error": "message", "code": "ERROR_CODE"}
+```
+
+- `success` (boolean): `true` for 2xx responses, `false` for 4xx/5xx
+- `data`: The response payload (present only when `success` is `true`)
+- `error` (string): Human-readable error message (present only when `success` is `false`)
+- `code` (string): Machine-readable error code for frontend handling (present only when `success` is `false`)
+
 ### Market Data
 | Method | Path | Description |
 |--------|------|-------------|
@@ -264,7 +293,7 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/api/watchlist` | Current watchlist tickers with latest prices |
-| POST | `/api/watchlist` | Add a ticker: `{ticker}` |
+| POST | `/api/watchlist` | Add a ticker: `{ticker}`. Validates against known symbols — returns 400 with code `UNKNOWN_TICKER` if unrecognized, 409 with code `DUPLICATE_TICKER` if already in watchlist |
 | DELETE | `/api/watchlist/{ticker}` | Remove a ticker |
 
 ### Chat
@@ -277,11 +306,15 @@ All tables include a `user_id` column defaulting to `"default"`. This is hardcod
 |--------|------|-------------|
 | GET | `/api/health` | Health check (for Docker/deployment) |
 
+**Rate limiting note**: Rate limiting is intentionally omitted for this MVP. For a single-user, course-project context this is acceptable. If deployed publicly, rate limiting should be added to `/api/portfolio/trade` and `/api/chat` endpoints.
+
 ---
 
 ## 9. LLM Integration
 
-When writing code to make calls to LLMs, use cerebras skill to use LiteLLM via OpenCode to the `opencode/deepseek-v4-flash-free` model with Cerebras as the inference provider. Structured Outputs should be used to interpret the results.
+When writing code to make calls to LLMs, use cerebras skill to use LiteLLM as a client library that calls OpenCode Go (as a gateway), which routes to the `opencode/deepseek-v4-flash-free` model — a model hosted by OpenCode — with Cerebras as the inference provider. Structured Outputs should be used to interpret the results.
+
+The call chain is: **LiteLLM → OpenCode Go → Cerebras → OpenCode-hosted model**. LiteLLM is the Python client library, OpenCode Go is the inference gateway, Cerebras provides fast inference, and the model `opencode/deepseek-v4-flash-free` is hosted by OpenCode.
 
 There is an OPENCODE_API_KEY in the .env file in the project root.
 
@@ -292,11 +325,11 @@ When the user sends a chat message, the backend:
 1. Loads the user's current portfolio context (cash, positions with P&L, watchlist with live prices, total portfolio value)
 2. Loads recent conversation history from the `chat_messages` table
 3. Constructs a prompt with a system message, portfolio context, conversation history, and the user's new message
-4. Calls the LLM via LiteLLM → OpenCode, requesting structured output, using the cerebras skill
+4. Calls the LLM via LiteLLM → OpenCode, requesting structured output, using the cerebras skill. Timeout: **30 seconds**. On timeout, retry up to **2 times** before returning an error message to the user.
 5. Parses the complete structured JSON response
-6. Auto-executes any trades or watchlist changes specified in the response
+6. Auto-executes any trades or watchlist changes — see *Auto-Execution* below
 7. Stores the message and executed actions in `chat_messages`
-8. Returns the complete JSON response to the frontend (no token-by-token streaming — Cerebras inference is fast enough that a loading indicator is sufficient)
+8. Returns the complete JSON response to the frontend (no token-by-token streaming — Cerebras inference is fast enough that a "LLM is thinking..." message with a loading indicator is sufficient. If latency becomes an issue, a token-streaming fallback can be added later)
 
 ### Structured Output Schema
 
@@ -325,7 +358,7 @@ Trades specified by the LLM execute automatically — no confirmation dialog. Th
 - It creates an impressive, fluid demo experience
 - It demonstrates agentic AI capabilities — the core theme of the course
 
-If a trade fails validation (e.g., insufficient cash), the error is included in the chat response so the LLM can inform the user.
+**Trade failure handling**: trades in a batch are validated upfront. If **any** trade in the batch fails validation (e.g., insufficient cash, unknown ticker), the **entire batch is rejected** — no partial execution. The backend appends a humanized error to the `message` field before returning, listing which trades failed and why. Example: *"I tried to buy 50 shares of NVDA and sell 10 shares of TSLA, but the NVDA purchase failed — you'd need $X more. No trades were executed."* A collapsible "technical details" section can expose the raw error for debugging.
 
 ### System Prompt Guidance
 
@@ -339,7 +372,7 @@ The LLM should be prompted as "FinAlly, an AI trading assistant" with instructio
 
 ### LLM Mock Mode
 
-When `LLM_MOCK=true`, the backend returns deterministic mock responses instead of calling OpenRouter. This enables:
+When `LLM_MOCK=true`, the backend returns deterministic mock responses instead of calling OpenCode. This enables:
 - Fast, free, reproducible E2E tests
 - Development without an API key
 - CI/CD pipelines
@@ -364,7 +397,7 @@ The frontend is a single-page application with a dense, terminal-inspired layout
 ### Technical Notes
 
 - Use `EventSource` for SSE connection to `/api/stream/prices`
-- Canvas-based charting library preferred (Lightweight Charts or Recharts) for performance
+- Use Lightweight Charts for all charts (canvas-based, high performance)
 - Price flash effect: on receiving a new price, briefly apply a CSS class with background color transition, then remove it
 - All API calls go to the same origin (`/api/*`) — no CORS configuration needed
 - Tailwind CSS for styling with a custom dark theme
@@ -399,13 +432,13 @@ The SQLite database persists via a named Docker volume:
 docker run -v finally-data:/app/db -p 8000:8000 --env-file .env finally
 ```
 
-The `db/` directory in the project root maps to `/app/db` in the container. The backend writes `finally.db` to this path.
+The top-level `db/` directory is the runtime volume mount point (see Section 4 for authoritative documentation). The backend writes `finally.db` to `/app/db` (`db/` on the host). The Dockerfile and backend config both use this path — any change to the database path must be updated in both `Dockerfile` and the backend's config.
 
 ### Start/Stop Scripts
 
 **`scripts/start_mac.sh`** (macOS/Linux):
 - Builds the Docker image if not already built (or if `--build` flag passed)
-- Runs the container with the volume mount, port mapping, and `.env` file
+- Runs the container with the volume mount, port mapping, and `.env` file. Uses `$(dirname "$0")/../.env` so the script works regardless of the user's current directory.
 - Prints the URL to access the app
 - Optionally opens the browser
 
@@ -442,7 +475,7 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 
 ### E2E Tests (in `test/`)
 
-**Infrastructure**: A separate `docker-compose.test.yml` in `test/` that spins up the app container plus a Playwright container. This keeps browser dependencies out of the production image.
+**Infrastructure**: A separate `docker-compose.test.yml` in `test/` that spins up the app container plus a Playwright container. This keeps browser dependencies out of the production image. E2E tests use a **fresh ephemeral volume** per run (not the dev named volume) to ensure full isolation and prevent test trades from corrupting development state.
 
 **Environment**: Tests run with `LLM_MOCK=true` by default for speed and determinism.
 
@@ -454,3 +487,4 @@ The container is designed to deploy to AWS App Runner, Render, or any container 
 - Portfolio visualization: heatmap renders with correct colors, P&L chart has data points
 - AI chat (mocked): send a message, receive a response, trade execution appears inline
 - SSE resilience: disconnect and verify reconnection
+
