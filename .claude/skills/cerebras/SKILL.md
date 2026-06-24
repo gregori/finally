@@ -1,18 +1,17 @@
 ---
-name: cerebras-inference
-description: Use this to write code to call an LLM using LiteLLM and OpenRouter with the Cerebras inference provider
+name: cerebras
+description: Use this to write code to call an LLM using LiteLLM and Opencode Go with the Cerebras inference provider.
 ---
 
 # Calling an LLM via Cerebras
 
-These instructions allow you write code to call an LLM with Cerebras specified as the inference provider.  
-This method uses LiteLLM and OpenRouter.
+These instructions allow you write code to call an LLM with Cerebras specified as the inference provider. This method uses LiteLLM and Opencode Go.
 
 ## Setup
 
-The OPENROUTER_API_KEY must be set in the .env file and loaded in as an environment variable.  
+The `OPENCODE_API_KEY` environment variable must be set to your OpenCode API key and it must be set in the `.env` file and loaded in as an environment variable.
 
-The uv project must include litellm and pydantic.
+The uv project must include litellm and pydantic:
 `uv add litellm pydantic`
 
 ## Code snippets
@@ -23,7 +22,7 @@ Use code like these examples in order to use Cerebras.
 
 ```python
 from litellm import completion
-MODEL = "openrouter/openai/gpt-oss-120b"
+MODEL = "opencode/deepseek-v4-flash-free"
 EXTRA_BODY = {"provider": {"order": ["cerebras"]}}
 ```
 
@@ -37,7 +36,7 @@ result = response.choices[0].message.content
 ### Code to call via Cerebras for a Structured Outputs response
 
 ```python
-response = completion(model=MODEL, messages=messages, response_format=MyBaseModelSubclass, reasoning_effort="low", extra_body=EXTRA_BODY)
+response = completion(model=MODEL, messages=messages, reasoning_effort="low", extra_body=EXTRA_BODY, response_format=MyBaseModelSubclass)
 result = response.choices[0].message.content
 result_as_object = MyBaseModelSubclass.model_validate_json(result)
 ```

@@ -1,4 +1,10 @@
 {
+    "permissions": {
+        "allow": [
+            "Write(planning/REVIEW.md)",
+            "Edit(planning/REVIEW.md)"
+        ]
+    },
     "hooks": {
         "Stop": [
             {
